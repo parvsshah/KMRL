@@ -5,9 +5,9 @@ import {
     Plus, Wrench, Trash2, Layers, ArrowRightLeft, Zap, Calendar, Activity, Info, ClipboardList,
     ChevronDown, Search
 } from 'lucide-react';
-import { cn } from '../utils';
+import { cn, getSCADAMetrics } from '../utils';
 import { useAppContext } from '../context/AppContext';
-import { CoachInstance, FormData, ReportData } from '../types';
+import { CoachInstance, FormData, ReportData, AuditLogEntry } from '../types';
 import { analyzeInductionReadiness } from '../services/api';
 import { supabase } from '../services/supabase';
 
@@ -23,8 +23,9 @@ export const PlannerDashboard = () => {
 
     const [inductionTab, setInductionTab] = useState<'composition' | 'maintenance'>('composition');
     const [editingTrainsetId, setEditingTrainsetId] = useState<string | null>(null);
-    const [coachFilter, setCoachFilter] = useState<'All' | 'Active' | 'Standby' | 'Idle'>('All');
+    const [coachFilter, setCoachFilter] = useState<'All' | 'Active' | 'Standby' | 'Idle' | 'Maintenance' | 'Cleaning'>('All');
     const [viewingCoach, setViewingCoach] = useState<CoachInstance | null>(null);
+    const [selectedBay, setSelectedBay] = useState<any | null>(null);
     const [modalTab, setModalTab] = useState<'single' | 'fleet'>('single');
     const [fleetReportSearch, setFleetReportSearch] = useState('');
     const [coachSearch, setCoachSearch] = useState('');
@@ -205,9 +206,14 @@ export const PlannerDashboard = () => {
             if (isSelected) {
                 updatedList = prev.selectedCoaches.filter(i => i !== coachId);
             } else {
+                const coach = coaches.find(c => c.id === coachId);
+                if (coach?.status === 'Maintenance' || coach?.status === 'Cleaning') {
+                    setError(`Coach ${coachId} is currently under ${coach.status} and is unavailable for scheduling.`);
+                    return prev;
+                }
+
                 if (prev.selectedCoaches.length >= 3) return prev;
                 
-                const coach = coaches.find(c => c.id === coachId);
                 const currentDMCs = prev.selectedCoaches.filter(id => coaches.find(c => c.id === id)?.type === 'DMC').length;
                 const currentTCs = prev.selectedCoaches.filter(id => coaches.find(c => c.id === id)?.type === 'TC').length;
                 
@@ -337,6 +343,7 @@ export const PlannerDashboard = () => {
 
         const startTime = new Date();
         const isCleaning = type === 'Cleaning';
+        const newStatus = isCleaning ? 'Cleaning' : 'Maintenance';
         
         const newSlot = {
             queue_number: (isCleaning ? cleaningQueue : maintenanceQueue).length + 1,
@@ -350,6 +357,60 @@ export const PlannerDashboard = () => {
         };
 
         try {
+            // Check if this coach is currently part of any active or standby trainset, and dismantle if so
+            const containingTrainset = fleet.find(f => f.coaches.includes(coachId));
+            if (containingTrainset) {
+                // Dismantle trainset: remove coach from unit composition
+                const updatedCoaches = containingTrainset.coaches.filter(id => id !== coachId);
+                
+                // Update fleet_units table
+                const { error: fleetUpdateErr } = await supabase.from('fleet_units')
+                    .update({
+                        coaches: updatedCoaches,
+                        status: newStatus,
+                        route: null,
+                        start_time: null,
+                        run_number: null
+                    })
+                    .eq('id', containingTrainset.id);
+                if (fleetUpdateErr) throw fleetUpdateErr;
+
+                // Terminate/delete any scheduled corridor departures for this trainset
+                const { error: schedDeleteErr } = await supabase.from('schedule_items')
+                    .delete()
+                    .eq('train_id', containingTrainset.id);
+                if (schedDeleteErr) throw schedDeleteErr;
+
+                // Sync frontend states optimistically
+                setFleet(prev => prev.map(f => f.id === containingTrainset.id ? {
+                    ...f,
+                    coaches: updatedCoaches,
+                    status: newStatus,
+                    route: null,
+                    startTime: null,
+                    runNumber: undefined
+                } : f));
+                setSchedule(prev => prev.filter(s => s.trainId !== containingTrainset.id));
+
+                // Capture SCADA Telemetry for this coach
+                const dismantleScada = getSCADAMetrics(coachId);
+
+                // Log trainset dismantling event to the System Audit Trail
+                const dismantleLogEntry = {
+                    id: `AUD-DISM-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                    type: 'Depot_Operation',
+                    category: 'Depot Operations',
+                    title: 'Trainset Dismantled',
+                    detail: `Active Trainset ${containingTrainset.id} dismantled: occupying Coach ${coachId} was scheduled for ${type}. Coach removed from composition.`,
+                    timestamp: new Date().toISOString(),
+                    operator: 'Planner',
+                    trainsetId: containingTrainset.id,
+                    coachId,
+                    scada: dismantleScada
+                };
+                setHistory(prev => [dismantleLogEntry as any, ...prev]);
+            }
+
             // 1. Insert into maintenance_slots
             const { error: slotErr } = await supabase.from('maintenance_slots').insert(newSlot);
             if (slotErr) throw slotErr;
@@ -362,15 +423,9 @@ export const PlannerDashboard = () => {
 
             // 3. Update coach status
             const { error: coachErr } = await supabase.from('coaches')
-                .update({ status: isCleaning ? 'Cleaning' : 'Maintenance' })
+                .update({ status: newStatus })
                 .eq('id', coachId);
             if (coachErr) throw coachErr;
-
-            // 4. Update fleet status (if it exists as a fleet unit)
-            const { error: fleetErr } = await supabase.from('fleet_units')
-                .update({ status: isCleaning ? 'Cleaning' : 'Maintenance' })
-                .eq('id', coachId);
-            // Ignored fleetErr here because a coach might not be a full fleet unit.
 
             // Optimistic UI updates
             const uiSlot = {
@@ -385,13 +440,152 @@ export const PlannerDashboard = () => {
                 setMaintenanceBays(prev => prev.map(b => b.id === bayId ? { ...b, status: 'Occupied', currentTask: coachId } : b));
             }
 
-            setCoaches(prev => prev.map(c => c.id === coachId ? { ...c, status: isCleaning ? 'Cleaning' : 'Maintenance' } : c));
-            setFleet(prev => prev.map(f => f.id === coachId ? { ...f, status: isCleaning ? 'Cleaning' : 'Maintenance' } : f));
+            setCoaches(prev => prev.map(c => c.id === coachId ? { ...c, status: newStatus } : c));
+            setFleet(prev => prev.map(f => f.id === coachId ? { ...f, status: newStatus } : f));
+
+            // Capture SCADA Telemetry at the time of scheduling
+            const scada = getSCADAMetrics(coachId);
+
+            // Log the scheduling event to System Audit Trail
+            const scheduleLogEntry = {
+                id: `AUD-SCHED-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                type: 'Depot_Operation',
+                category: 'Depot Operations',
+                title: `${type} Scheduled`,
+                detail: `Planner scheduled Coach ${coachId} for ${type} in Bay ${bayId} (${durationHours}h expected duration).`,
+                timestamp: new Date().toISOString(),
+                operator: 'Planner',
+                bayId,
+                coachId,
+                scada
+            };
+            setHistory(prev => [scheduleLogEntry as any, ...prev]);
+
             setMaintScheduleData(p => ({ ...p, coachId: '', bayId: '' }));
             alert('Service slot successfully booked and database updated.');
         } catch (err: any) {
             console.error("Error scheduling maintenance:", err);
             setError("Failed to sync schedule with database: " + err.message);
+        }
+    };
+
+    // Yard Planner Live Bay Management - Toggle Offline/Online
+    const toggleBayFunctionality = async (bayId: string, type: 'Maintenance' | 'Cleaning') => {
+        const isMaint = type === 'Maintenance';
+        const baysList = isMaint ? maintenanceBays : cleaningBays;
+        const setBays = isMaint ? setMaintenanceBays : setCleaningBays;
+        const bay = baysList.find(b => b.id === bayId);
+        if (!bay) return;
+
+        const nextFunctional = !bay.functional;
+        const nextStatus = nextFunctional ? 'Available' : 'Maintenance';
+
+        try {
+            const { error } = await supabase.from('bays')
+                .update({ 
+                    functional: nextFunctional,
+                    status: nextStatus,
+                    current_task: null
+                })
+                .eq('id', bayId);
+
+            if (error) throw error;
+
+            setBays(prev => prev.map(b => b.id === bayId ? {
+                ...b,
+                functional: nextFunctional,
+                status: nextStatus,
+                currentTask: null
+            } : b));
+
+            // Log bay state toggle to System Audit Trail
+            const logEntry = {
+                id: `AUD-BAY-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                type: 'Depot_Operation',
+                category: 'Depot Operations',
+                title: nextFunctional ? 'Bay Set Online' : 'Bay Set Offline',
+                detail: `Planner marked Bay ${bayId} ${nextFunctional ? 'Online' : 'Offline (Maintenance/Deactivated)'}.`,
+                timestamp: new Date().toISOString(),
+                operator: 'Planner',
+                bayId
+            };
+            setHistory(prev => [logEntry as any, ...prev]);
+
+            if (selectedBay && selectedBay.id === bayId) {
+                setSelectedBay(prev => prev ? {
+                    ...prev,
+                    functional: nextFunctional,
+                    status: nextStatus,
+                    currentTask: null
+                } : null);
+            }
+
+            alert(`Bay ${bayId} is now ${nextFunctional ? 'Online' : 'Offline (Maintenance)'}`);
+        } catch (err: any) {
+            console.error("Error toggling bay functionality:", err);
+            setError("Failed to toggle bay status: " + err.message);
+        }
+    };
+
+    // Yard Planner Live Bay Management - Complete Servicing & Release Coach
+    const completeBayTask = async (bayId: string, type: 'Maintenance' | 'Cleaning', coachId: string) => {
+        if (!confirm(`Are you sure you want to complete the servicing for Coach ${coachId} in ${bayId}?`)) return;
+
+        const isMaint = type === 'Maintenance';
+        const setBays = isMaint ? setMaintenanceBays : setCleaningBays;
+
+        try {
+            // 1. Update bay in DB
+            const { error: bayErr } = await supabase.from('bays')
+                .update({ status: 'Available', current_task: null })
+                .eq('id', bayId);
+            if (bayErr) throw bayErr;
+
+            // 2. Update coach in DB (Restore health to 100% and state back to Standby)
+            const { error: coachErr } = await supabase.from('coaches')
+                .update({ health: 100, status: 'Standby' })
+                .eq('id', coachId);
+            if (coachErr) throw coachErr;
+
+            // 3. Remove queued items if any
+            const { error: queueErr } = await supabase.from('maintenance_slots')
+                .delete()
+                .eq('train_id', coachId)
+                .eq('bay_id', bayId);
+
+            // 4. Update UI states optimistically
+            setBays(prev => prev.map(b => b.id === bayId ? { ...b, status: 'Available', currentTask: null } : b));
+            setCoaches(prev => prev.map(c => c.id === coachId ? { ...c, health: 100, status: 'Standby' } : c));
+            
+            if (isMaint) {
+                setMaintenanceQueue(prev => prev.filter(q => q.trainId !== coachId));
+            } else {
+                setCleaningQueue(prev => prev.filter(q => q.trainId !== coachId));
+            }
+
+            // Capture SCADA Telemetry at release time
+            const scada = getSCADAMetrics(coachId);
+
+            // Log completion and release to System Audit Trail
+            const logEntry = {
+                id: `AUD-RELEASE-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                type: 'Depot_Operation',
+                category: 'Depot Operations',
+                title: 'Servicing Completed & Released',
+                detail: `Planner completed servicing and released Coach ${coachId} from Bay ${bayId} back to Standby roster. Health restored to 100%.`,
+                timestamp: new Date().toISOString(),
+                operator: 'Planner',
+                bayId,
+                coachId,
+                scada
+            };
+            setHistory(prev => [logEntry as any, ...prev]);
+
+            setSelectedBay(null);
+            alert(`Servicing complete! Coach ${coachId} is now fully operational (100% Health) and returned to Standby roster.`);
+        } catch (err: any) {
+            console.error("Error completing bay task:", err);
+            setError("Failed to complete service: " + err.message);
         }
     };
 
@@ -587,28 +781,32 @@ export const PlannerDashboard = () => {
         const isSelected = formData.selectedCoaches.includes(c.id);
         const isOriginal = editingTrainsetId && fleet.find(f => f.id === editingTrainsetId)?.coaches.includes(c.id);
         const isFit = c.health > 90 && (c.status === 'Standby' || isOriginal);
+        
+        const isUnavailable = c.status === 'Maintenance' || c.status === 'Cleaning';
+        const isCoachLocked = isLocked || isUnavailable;
 
         return (
             <motion.div
                 key={c.id}
-                whileHover={{ backgroundColor: "rgba(241, 245, 249, 0.5)" }}
+                whileHover={isCoachLocked ? undefined : { backgroundColor: "rgba(241, 245, 249, 0.5)" }}
                 className={cn(
-                    "flex items-center justify-between p-3 border-b border-slate-100 transition-all cursor-pointer",
+                    "flex items-center justify-between p-3 border-b border-slate-100 transition-all",
                     isSelected ? "bg-metro-blue/5 border-l-4 border-l-metro-blue pl-2" : "bg-white hover:bg-slate-50",
-                    isLocked ? "opacity-50 cursor-not-allowed pointer-events-none" : ""
+                    isCoachLocked ? "opacity-50 cursor-not-allowed pointer-events-none" : "cursor-pointer"
                 )}
-                onClick={() => !isLocked && toggleCoachSelection(c.id)}
+                onClick={() => !isCoachLocked && toggleCoachSelection(c.id)}
             >
                 <div className="flex items-center gap-3">
                     <div className={cn(
                         "w-5 h-5 rounded border flex items-center justify-center transition-all",
-                        isSelected ? "bg-metro-blue border-metro-blue text-white" : "border-slate-300"
+                        isSelected ? "bg-metro-blue border-metro-blue text-white" : "border-slate-300",
+                        isCoachLocked ? "bg-slate-100 border-slate-200 text-slate-400" : ""
                     )}>
                         {isSelected && <CheckCircle2 className="w-3.5 h-3.5 stroke-[3]" />}
                     </div>
 
                     <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 flex-wrap">
                             <span className="font-bold text-slate-800 text-sm tracking-wide">{c.id}</span>
                             <span className={cn(
                                 "text-[10px] px-2 py-0.5 font-bold rounded",
@@ -618,6 +816,16 @@ export const PlannerDashboard = () => {
                             </span>
                             {isOriginal && <span className="bg-metro-blue text-white text-[8px] font-black px-1.5 py-0.5 rounded shadow-sm">CURRENT</span>}
                             {isFit && !isSelected && !isOriginal && <span className="bg-green-500 text-white text-[8px] font-black px-1.5 py-0.5 rounded shadow-sm">FIT</span>}
+                            {c.status === 'Maintenance' && (
+                                <span className="bg-red-500 text-white text-[9px] font-extrabold px-2 py-0.5 rounded shadow-sm uppercase tracking-wide animate-pulse">
+                                    UNDER MAINTENANCE - UNAVAILABLE
+                                </span>
+                            )}
+                            {c.status === 'Cleaning' && (
+                                <span className="bg-amber-500 text-white text-[9px] font-extrabold px-2 py-0.5 rounded shadow-sm uppercase tracking-wide animate-pulse">
+                                    IN CLEANING BAY - UNAVAILABLE
+                                </span>
+                            )}
                         </div>
                         
                         <div className="flex items-center gap-3 text-xs text-slate-500">
@@ -626,7 +834,8 @@ export const PlannerDashboard = () => {
                                 c.status === 'Active' ? "bg-green-50 text-green-700 border border-green-200" :
                                 c.status === 'Standby' ? "bg-amber-50 text-amber-700 border border-amber-200" :
                                 c.status === 'Idle' ? "bg-slate-100 text-slate-600 border border-slate-200" :
-                                "bg-red-50 text-red-700 border border-red-200"
+                                c.status === 'Maintenance' ? "bg-red-50 text-red-705 border border-red-200 font-bold" :
+                                "bg-amber-50 text-amber-705 border border-amber-200 font-bold" // Cleaning
                             )}>
                                 {c.status}
                             </span>
@@ -1138,7 +1347,7 @@ export const PlannerDashboard = () => {
                                             <div className="flex items-center gap-2">
                                                 <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider w-12 shrink-0">Status:</span>
                                                 <div className="flex flex-wrap gap-1">
-                                                    {(['All', 'Active', 'Standby', 'Idle'] as const).map(status => (
+                                                    {(['All', 'Active', 'Standby', 'Idle', 'Maintenance', 'Cleaning'] as const).map(status => (
                                                         <button
                                                             key={status}
                                                             type="button"
@@ -1363,18 +1572,28 @@ export const PlannerDashboard = () => {
                                     </h4>
                                     <div className="space-y-2">
                                         {maintenanceBays.map(bay => (
-                                            <div key={bay.id} className="bg-white p-3 rounded-lg border border-slate-200 flex justify-between items-center shadow-sm">
+                                            <div 
+                                                key={bay.id} 
+                                                onClick={() => setSelectedBay(bay)}
+                                                className="bg-white p-3 rounded-lg border border-slate-200 flex justify-between items-center shadow-sm cursor-pointer hover:border-metro-blue/45 hover:shadow-md hover:bg-slate-50/50 transition-all"
+                                            >
                                                 <div>
-                                                    <span className="font-bold text-xs text-slate-800">{bay.id}</span>
+                                                    <div className="flex items-center gap-1.5">
+                                                        <span className="font-bold text-xs text-slate-800">{bay.id}</span>
+                                                        {!bay.functional && (
+                                                            <span className="bg-slate-600 text-white text-[8px] font-black px-1.5 py-0.5 rounded shadow-sm">OFFLINE</span>
+                                                        )}
+                                                    </div>
                                                     <p className="text-[10px] text-slate-500 mt-0.5">
                                                         {bay.status === 'Occupied' ? `Executing: ${bay.currentTask}` : 'Ready for bookings'}
                                                     </p>
                                                 </div>
                                                 <span className={cn(
                                                     "text-[8px] font-black uppercase px-2 py-0.5 rounded shadow-sm",
+                                                    !bay.functional ? 'bg-slate-100 text-slate-400 border border-slate-200' :
                                                     bay.status === 'Available' ? 'bg-green-100 text-green-700' : 'bg-orange-100 text-metro-orange'
                                                 )}>
-                                                    {bay.status}
+                                                    {!bay.functional ? 'OFFLINE' : bay.status}
                                                 </span>
                                             </div>
                                         ))}
@@ -1389,19 +1608,29 @@ export const PlannerDashboard = () => {
                                     </h4>
                                     <div className="space-y-2">
                                         {cleaningBays.map(bay => (
-                                            <div key={bay.id} className="bg-white p-3 rounded-lg border border-slate-200 flex justify-between items-center shadow-sm">
+                                            <div 
+                                                key={bay.id} 
+                                                onClick={() => setSelectedBay(bay)}
+                                                className="bg-white p-3 rounded-lg border border-slate-200 flex justify-between items-center shadow-sm cursor-pointer hover:border-metro-blue/45 hover:shadow-md hover:bg-slate-50/50 transition-all"
+                                            >
                                                 <div>
-                                                    <span className="font-bold text-xs text-slate-800">{bay.id}</span>
+                                                    <div className="flex items-center gap-1.5">
+                                                        <span className="font-bold text-xs text-slate-800">{bay.id}</span>
+                                                        {!bay.functional && (
+                                                            <span className="bg-slate-600 text-white text-[8px] font-black px-1.5 py-0.5 rounded shadow-sm">OFFLINE</span>
+                                                        )}
+                                                    </div>
                                                     <p className="text-[10px] text-slate-500 mt-0.5">
                                                         {bay.status === 'Occupied' ? `Washing: ${bay.currentTask}` : 'Ready for bookings'}
                                                     </p>
                                                 </div>
                                                 <span className={cn(
                                                     "text-[8px] font-black uppercase px-2 py-0.5 rounded shadow-sm",
+                                                    !bay.functional ? 'bg-slate-100 text-slate-400 border border-slate-200' :
                                                     bay.status === 'Available' ? 'bg-green-100 text-green-700' : 
                                                     bay.status === 'Maintenance' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-metro-blue'
                                                 )}>
-                                                    {bay.status}
+                                                    {!bay.functional ? 'OFFLINE' : bay.status}
                                                 </span>
                                             </div>
                                         ))}
@@ -1689,6 +1918,168 @@ export const PlannerDashboard = () => {
                         </motion.div>
                     </div>
                 )}
+
+                {selectedBay && (() => {
+                    const isMaintBay = maintenanceBays.some(b => b.id === selectedBay.id) || selectedBay.id.startsWith('M-');
+                    const bayType = isMaintBay ? 'Maintenance' : 'Cleaning';
+                    const occupiedCoach = coaches.find(c => c.id === selectedBay.currentTask || selectedBay.currentTask?.includes(c.id));
+                    const scada = occupiedCoach ? getSCADAMetrics(occupiedCoach.id) : null;
+
+                    return (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+                            <motion.div 
+                                initial={{ opacity: 0, scale: 0.95 }} 
+                                animate={{ opacity: 1, scale: 1 }} 
+                                exit={{ opacity: 0, scale: 0.95 }}
+                                className="bg-white/90 backdrop-blur-md rounded-2xl shadow-xl w-full max-w-lg overflow-hidden flex flex-col border border-white/20 transition-all duration-300 animate-in fade-in zoom-in-95 duration-200"
+                            >
+                                {/* Modal Header */}
+                                <div className="p-6 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
+                                    <div>
+                                        <h3 className="font-display font-bold text-xl flex items-center gap-2 text-slate-800">
+                                            <Wrench className={cn("w-5 h-5", isMaintBay ? "text-metro-orange" : "text-metro-blue")} />
+                                            {selectedBay.id} Inspector
+                                        </h3>
+                                        <p className="text-xs text-slate-500 mt-1">
+                                            {bayType} Bay • Yard Operations Terminal
+                                        </p>
+                                    </div>
+                                    <button 
+                                        type="button"
+                                        onClick={() => setSelectedBay(null)}
+                                        className="text-slate-400 hover:text-slate-600 transition-colors p-1.5 rounded-full hover:bg-slate-200"
+                                    >
+                                        ✕
+                                    </button>
+                                </div>
+
+                                {/* Modal Body */}
+                                <div className="p-6 space-y-6">
+                                    {/* Bay Status Details Card */}
+                                    <div className="p-4 bg-slate-50 rounded-xl border border-slate-150 flex justify-between items-center">
+                                        <div>
+                                            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider block">Operational Status</span>
+                                            <div className="flex items-center gap-2 mt-1">
+                                                <span className={cn(
+                                                    "w-2.5 h-2.5 rounded-full",
+                                                    !selectedBay.functional ? "bg-red-500 animate-pulse" :
+                                                    selectedBay.status === 'Available' ? "bg-green-500" : "bg-metro-orange animate-pulse"
+                                                )} />
+                                                <span className="text-sm font-bold text-slate-700">
+                                                    {!selectedBay.functional ? "Offline (Deactivated)" :
+                                                     selectedBay.status === 'Available' ? "Online - Available" : "Occupied - Active Task"}
+                                                </span>
+                                            </div>
+                                        </div>
+                                        
+                                        {/* Quick Toggle Button */}
+                                        <button
+                                            type="button"
+                                            onClick={() => toggleBayFunctionality(selectedBay.id, bayType)}
+                                            className={cn(
+                                                "px-3 py-1.5 rounded-lg text-xs font-bold transition-all border shadow-sm",
+                                                selectedBay.functional 
+                                                    ? "bg-red-50 text-red-650 border-red-200 hover:bg-red-100" 
+                                                    : "bg-green-50 text-emerald-650 border-green-200 hover:bg-green-100"
+                                            )}
+                                        >
+                                            {selectedBay.functional ? "Set Offline" : "Set Online"}
+                                        </button>
+                                    </div>
+
+                                    {/* Occupied Diagnostics Section */}
+                                    {selectedBay.status === 'Occupied' && occupiedCoach && (
+                                        <div className="space-y-4">
+                                            <div className="flex items-center justify-between">
+                                                <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wider">
+                                                    Occupied Coach: <span className="font-extrabold text-metro-blue">{occupiedCoach.id}</span>
+                                                </h4>
+                                                <span className="bg-slate-100 text-slate-605 px-2 py-0.5 rounded text-[10px] font-bold">
+                                                    Health: {occupiedCoach.health}%
+                                                </span>
+                                            </div>
+
+                                            {scada && (
+                                                <div className="p-4 bg-slate-950 text-slate-200 rounded-xl border border-slate-800 space-y-3.5 shadow-lg">
+                                                    <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                                                        <h5 className="text-[10px] text-slate-400 font-bold uppercase tracking-wider flex items-center gap-1.5 font-mono">
+                                                            <Activity className="w-3.5 h-3.5 text-metro-blue animate-pulse" />
+                                                            Live SCADA Subsystem Wear Telemetry
+                                                        </h5>
+                                                        <span className="text-[8px] bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded font-black font-mono">
+                                                            STREAMING LIVE
+                                                        </span>
+                                                    </div>
+
+                                                    <div className="grid grid-cols-2 gap-3 text-xs font-mono">
+                                                        <div className="p-2.5 bg-slate-900/80 rounded-lg border border-slate-800/60">
+                                                            <span className="text-[8px] text-slate-500 font-sans uppercase font-bold block">Brake Pad Thickness</span>
+                                                            <span className="text-white font-extrabold text-sm block mt-0.5">{scada.brakePad}</span>
+                                                        </div>
+                                                        <div className="p-2.5 bg-slate-900/80 rounded-lg border border-slate-800/60">
+                                                            <span className="text-[8px] text-slate-500 font-sans uppercase font-bold block">Panto Force</span>
+                                                            <span className="text-white font-extrabold text-sm block mt-0.5">{scada.pantoForce}</span>
+                                                        </div>
+                                                        <div className="p-2.5 bg-slate-900/80 rounded-lg border border-slate-800/60">
+                                                            <span className="text-[8px] text-slate-500 font-sans uppercase font-bold block">Shoe Temp</span>
+                                                            <span className="text-white font-extrabold text-sm block mt-0.5">{scada.shoeTemp}</span>
+                                                        </div>
+                                                        <div className="p-2.5 bg-slate-900/80 rounded-lg border border-slate-800/60">
+                                                            <span className="text-[8px] text-slate-500 font-sans uppercase font-bold block">Vibration Levels</span>
+                                                            <span className="text-white font-extrabold text-sm block mt-0.5">{scada.vibrations}</span>
+                                                        </div>
+                                                        <div className="col-span-2 p-2.5 bg-slate-900/80 rounded-lg border border-slate-800/60 flex justify-between items-center">
+                                                            <div>
+                                                                <span className="text-[8px] text-slate-500 font-sans uppercase font-bold block">Accumulated Door Cycles</span>
+                                                                <span className="text-white font-extrabold text-sm block mt-0.5">{scada.doorCycles}</span>
+                                                            </div>
+                                                            <div className="text-right">
+                                                                <span className="text-[8px] text-slate-500 font-sans uppercase font-bold block">Est. Remaining Life</span>
+                                                                <span className="text-emerald-400 font-black block mt-0.5">Optimal</span>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+
+                                    {selectedBay.status === 'Available' && (
+                                        <div className="text-center py-6 text-slate-500 space-y-2">
+                                            <CheckCircle2 className="w-10 h-10 mx-auto text-green-500 stroke-[1.5]" />
+                                            <h5 className="font-bold text-slate-700">Bay is Vacant</h5>
+                                            <p className="text-xs text-slate-400 max-w-xs mx-auto">
+                                                No active servicing tasks are currently scheduled for this bay. Mark offline or book a coach for maintenance.
+                                            </p>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {/* Modal Footer */}
+                                <div className="p-6 border-t border-slate-100 bg-slate-50 flex justify-between items-center">
+                                    <button 
+                                        type="button"
+                                        onClick={() => setSelectedBay(null)} 
+                                        className="px-4 py-2 rounded-lg bg-slate-200 text-slate-700 font-bold hover:bg-slate-300 transition-colors text-xs"
+                                    >
+                                        Close
+                                    </button>
+
+                                    {selectedBay.status === 'Occupied' && occupiedCoach && selectedBay.functional && (
+                                        <button
+                                            type="button"
+                                            onClick={() => completeBayTask(selectedBay.id, bayType, occupiedCoach.id)}
+                                            className="px-5 py-2 rounded-lg bg-metro-orange text-white font-bold hover:bg-metro-orange-dark shadow-md text-xs flex items-center gap-1.5"
+                                        >
+                                            <CheckCircle2 className="w-4 h-4" />
+                                            Complete Servicing & Release
+                                        </button>
+                                    )}
+                                </div>
+                            </motion.div>
+                        </div>
+                    );
+                })()}
             </AnimatePresence>
         </>
     );

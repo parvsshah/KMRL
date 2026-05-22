@@ -5,7 +5,8 @@ import {
     ScheduleItem, 
     MaintenanceSlot, 
     Bay, 
-    ReportData 
+    ReportData,
+    AuditLogEntry
 } from '../types';
 import { supabase } from '../services/supabase';
 // Removing local mock data imports
@@ -28,8 +29,8 @@ interface AppContextType {
     setCleaningBays: React.Dispatch<React.SetStateAction<Bay[]>>;
     report: ReportData | null;
     setReport: React.Dispatch<React.SetStateAction<ReportData | null>>;
-    history: ReportData[];
-    setHistory: React.Dispatch<React.SetStateAction<ReportData[]>>;
+    history: any[];
+    setHistory: React.Dispatch<React.SetStateAction<any[]>>;
     isLoading: boolean;
     error: string | null;
     userRole: 'Planner' | 'Supervisor' | null;
@@ -48,9 +49,16 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     const [cleaningBays, setCleaningBays] = useState<Bay[]>([]);
     
     const [report, setReport] = useState<ReportData | null>(null);
-    const [history, setHistory] = useState<ReportData[]>([]);
+    const [history, setHistory] = useState<any[]>(() => {
+        const stored = localStorage.getItem('kmrl_audit_history');
+        return stored ? JSON.parse(stored) : [];
+    });
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
+
+    useEffect(() => {
+        localStorage.setItem('kmrl_audit_history', JSON.stringify(history));
+    }, [history]);
 
     const [userRole, setUserRoleState] = useState<'Planner' | 'Supervisor' | null>(() => {
         return localStorage.getItem('kmrl_user_role') as 'Planner' | 'Supervisor' | null;

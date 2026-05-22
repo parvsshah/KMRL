@@ -8,10 +8,13 @@ import os
 from data_generator import generate_synthetic_kmrl_telemetry
 
 def train_predictive_models():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     # 1. Ensure dataset exists
-    csv_path = "data/kmrl_telemetry_historical.csv"
+    csv_path = os.path.join(base_dir, "data", "kmrl_telemetry_historical.csv")
     if not os.path.exists(csv_path):
         print("Dataset not found. Generating fresh synthetic telemetry logs...")
+        # To call generate_synthetic_kmrl_telemetry robustly, let's import it
+        from ml_engine.data_generator import generate_synthetic_kmrl_telemetry
         df = generate_synthetic_kmrl_telemetry()
     else:
         df = pd.read_csv(csv_path)
@@ -68,9 +71,10 @@ def train_predictive_models():
         print(f"  {name:25s}: {imp * 100:.2f}%")
         
     # 5. Serialize / Save Models
-    os.makedirs("models", exist_ok=True)
-    joblib.dump(regressor, "models/rul_regressor_model.pkl")
-    joblib.dump(classifier, "models/urgency_classifier_model.pkl")
+    models_dir = os.path.join(base_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    joblib.dump(regressor, os.path.join(models_dir, "rul_regressor_model.pkl"))
+    joblib.dump(classifier, os.path.join(models_dir, "urgency_classifier_model.pkl"))
     print("\nModels successfully serialized and saved to 'models/' directory.")
 
 if __name__ == "__main__":

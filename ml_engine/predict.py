@@ -8,11 +8,18 @@ def load_predictive_models():
     """
     Loads serialized predictive maintenance models from disk.
     """
-    regressor_path = "models/rul_regressor_model.pkl"
-    classifier_path = "models/urgency_classifier_model.pkl"
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    regressor_path = os.path.join(base_dir, "models", "rul_regressor_model.pkl")
+    classifier_path = os.path.join(base_dir, "models", "urgency_classifier_model.pkl")
     
     if not os.path.exists(regressor_path) or not os.path.exists(classifier_path):
-        print("Serialized model files not found. Please run 'python train.py' first to train models.")
+        # Let's try training models automatically if they are missing
+        print("Serialized model files not found. Attempting to train models first...")
+        from ml_engine.train import train_predictive_models
+        train_predictive_models()
+        
+    if not os.path.exists(regressor_path) or not os.path.exists(classifier_path):
+        print("Serialized model files not found even after training attempt. Please run 'python train.py' first.")
         sys.exit(1)
         
     regressor = joblib.load(regressor_path)

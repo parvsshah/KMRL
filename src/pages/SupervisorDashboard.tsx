@@ -10,21 +10,167 @@ import {
     X,
     FileText,
     ArrowLeftRight,
-    Ban
+    Ban,
+    Activity,
+    Wrench,
+    Sparkles,
+    Eye,
+    Clock
 } from 'lucide-react';
-import { cn } from '../utils';
+import { cn, getSCADAMetrics } from '../utils';
 import { useAppContext } from '../context/AppContext';
 import { supabase } from '../services/supabase';
 
 export const SupervisorDashboard = () => {
     const { 
         fleet, setFleet, schedule, setSchedule,
-        coaches, setCoaches, maintenanceBays, cleaningBays
+        coaches, setCoaches, 
+        maintenanceBays, setMaintenanceBays, 
+        cleaningBays, setCleaningBays,
+        history, setHistory
     } = useAppContext();
 
     // Modals & Popups states
     const [reportModalSchedId, setReportModalSchedId] = useState<string | null>(null);
     const [swapModalActiveInfo, setSwapModalActiveInfo] = useState<{ activeTrainId: string; scheduleId: string } | null>(null);
+    const [selectedBay, setSelectedBay] = useState<any | null>(null);
+
+    const [bayComments, setBayComments] = useState<Record<string, string>>(() => {
+        const comments: Record<string, string> = {};
+        try {
+            const bayIds = ['M-BAY-1', 'M-BAY-2', 'M-BAY-3', 'C-BAY-1', 'C-BAY-2', 'C-BAY-3', 'C-BAY-4'];
+            bayIds.forEach(id => {
+                const stored = localStorage.getItem(`bay_comment_${id}`);
+                if (stored) {
+                    comments[id] = stored;
+                }
+            });
+        } catch (e) {
+            console.error("Error loading comments from localStorage", e);
+        }
+        return comments;
+    });
+
+    const [commentInput, setCommentInput] = useState<string>('');
+    const [isSavingComment, setIsSavingComment] = useState<boolean>(false);
+    const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
+
+    React.useEffect(() => {
+        if (selectedBay) {
+            setCommentInput(bayComments[selectedBay.id] || '');
+            setSaveSuccess(false);
+        }
+    }, [selectedBay, bayComments]);
+
+    const saveBayComment = (bayId: string) => {
+        setIsSavingComment(true);
+        try {
+            localStorage.setItem(`bay_comment_${bayId}`, commentInput);
+            setBayComments(prev => ({
+                ...prev,
+                [bayId]: commentInput
+            }));
+
+            // Capture SCADA Telemetry if a coach is occupying the bay
+            const isMaint = bayId.startsWith('M-');
+            const bay = (isMaint ? maintenanceBays : cleaningBays).find(b => b.id === bayId);
+            const occupyingCoach = bay?.currentTask;
+            const scada = occupyingCoach ? getSCADAMetrics(occupyingCoach) : undefined;
+
+            const logEntry = {
+                id: `AUD-COM-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                type: 'Depot_Operation',
+                category: 'Depot Operations',
+                title: 'Supervisor Comment Filed',
+                detail: `Supervisor filed comment on Bay ${bayId}${occupyingCoach ? ` (Occupying Coach: ${occupyingCoach})` : ''}: "${commentInput}"`,
+                timestamp: new Date().toISOString(),
+                operator: 'Supervisor',
+                bayId,
+                coachId: occupyingCoach || undefined,
+                scada
+            };
+            setHistory(prev => [logEntry as any, ...prev]);
+
+            setSaveSuccess(true);
+            setTimeout(() => setSaveSuccess(false), 3000);
+        } catch (e) {
+            console.error("Error saving comment", e);
+        } finally {
+            setIsSavingComment(false);
+        }
+    };
+
+    const toggleBayFunctionality = async (bayId: string, type: 'Maintenance' | 'Cleaning') => {
+        const isMaint = type === 'Maintenance';
+        const baysList = isMaint ? maintenanceBays : cleaningBays;
+        const setBays = isMaint ? setMaintenanceBays : setCleaningBays;
+        const bay = baysList.find(b => b.id === bayId);
+        if (!bay) return;
+
+        const nextFunctional = !bay.functional;
+        const nextStatus = nextFunctional ? 'Available' : 'Maintenance';
+
+        try {
+            const { error } = await supabase.from('bays')
+                .update({ 
+                    functional: nextFunctional,
+                    status: nextStatus,
+                    current_task: null
+                })
+                .eq('id', bayId);
+
+            if (error) throw error;
+
+            setBays(prev => prev.map(b => b.id === bayId ? {
+                ...b,
+                functional: nextFunctional,
+                status: nextStatus,
+                currentTask: null
+            } : b));
+
+            if (selectedBay && selectedBay.id === bayId) {
+                setSelectedBay(prev => prev ? {
+                    ...prev,
+                    functional: nextFunctional,
+                    status: nextStatus,
+                    currentTask: null
+                } : null);
+            }
+
+            alert(`Bay ${bayId} is now ${nextFunctional ? 'Online' : 'Offline (Maintenance)'}`);
+        } catch (err: any) {
+            console.error("Error toggling bay functionality:", err);
+            alert("Failed to toggle bay status: " + err.message);
+        }
+    };
+
+    const completeBayTask = async (bayId: string, type: 'Maintenance' | 'Cleaning', coachId: string) => {
+        if (!confirm(`Are you sure you want to complete the servicing for Coach ${coachId} in ${bayId}?`)) return;
+
+        const isMaint = type === 'Maintenance';
+        const setBays = isMaint ? setMaintenanceBays : setCleaningBays;
+
+        try {
+            const { error: bayErr } = await supabase.from('bays')
+                .update({ status: 'Available', current_task: null })
+                .eq('id', bayId);
+            if (bayErr) throw bayErr;
+
+            const { error: coachErr } = await supabase.from('coaches')
+                .update({ health: 100, status: 'Standby' })
+                .eq('id', coachId);
+            if (coachErr) throw coachErr;
+
+            setBays(prev => prev.map(b => b.id === bayId ? { ...b, status: 'Available', currentTask: null } : b));
+            setCoaches(prev => prev.map(c => c.id === coachId ? { ...c, health: 100, status: 'Standby' } : c));
+
+            setSelectedBay(null);
+            alert(`Servicing complete! Coach ${coachId} is now fully operational (100% Health) and returned to Standby roster.`);
+        } catch (err: any) {
+            console.error("Error completing bay task:", err);
+            alert("Failed to complete bay task: " + err.message);
+        }
+    };
 
     const pendingApprovals = schedule.filter(s => s.controlStatus === 'Pending');
     const activeTrains = schedule.filter(s => s.controlStatus === 'Approved');
@@ -90,6 +236,24 @@ export const SupervisorDashboard = () => {
                 return f;
             }));
 
+            // Log to Audit Trail with SCADA telemetry for the primary coach
+            const firstCoachId = targetTrain?.coaches?.[0];
+            const scada = firstCoachId ? getSCADAMetrics(firstCoachId) : undefined;
+
+            const logEntry = {
+                id: `AUD-APP-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                type: 'Depot_Operation',
+                category: 'Approvals',
+                title: 'Induction Proposal Approved',
+                detail: `Supervisor approved induction for Trainset ${finalTrainId} onto Route: ${sched.route} (Run: ${runNumber}). Primary coach SCADA data captured.`,
+                timestamp: new Date().toISOString(),
+                operator: 'Supervisor',
+                trainsetId: finalTrainId,
+                coachId: firstCoachId,
+                scada
+            };
+            setHistory(prev => [logEntry as any, ...prev]);
+
             // Close modals
             setReportModalSchedId(null);
             alert(`Induction approved! ${finalTrainId} is now Active In-Service.`);
@@ -117,6 +281,24 @@ export const SupervisorDashboard = () => {
             setSchedule(prev => prev.filter(s => s.id !== id));
             setCoaches(prev => prev.map(c => unit?.coaches.includes(c.id) ? { ...c, status: 'Standby' } : c));
             setFleet(prev => prev.filter(f => f.id !== trainId)); 
+
+            // Log to Audit Trail with SCADA telemetry for the primary coach
+            const firstCoachId = unit?.coaches?.[0];
+            const scada = firstCoachId ? getSCADAMetrics(firstCoachId) : undefined;
+
+            const logEntry = {
+                id: `AUD-REJ-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                type: 'Depot_Operation',
+                category: 'Rejections',
+                title: 'Induction Proposal Rejected',
+                detail: `Supervisor rejected induction proposal for Trainset ${trainId}. Primary coach SCADA data captured.`,
+                timestamp: new Date().toISOString(),
+                operator: 'Supervisor',
+                trainsetId: trainId,
+                coachId: firstCoachId,
+                scada
+            };
+            setHistory(prev => [logEntry as any, ...prev]);
 
             setReportModalSchedId(null);
             alert("Schedule proposal successfully rejected.");
@@ -191,6 +373,25 @@ export const SupervisorDashboard = () => {
                 return f;
             }));
 
+            // Log to Audit Trail with SCADA telemetry for the promoted standby coach
+            const standbyTrain = fleet.find(f => f.id === standbyId);
+            const firstStandbyCoachId = standbyTrain?.coaches?.[0];
+            const scada = firstStandbyCoachId ? getSCADAMetrics(firstStandbyCoachId) : undefined;
+
+            const logEntry = {
+                id: `AUD-SWAP-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                type: 'Depot_Operation',
+                category: 'Depot Operations',
+                title: 'Standby Swap Executed',
+                detail: `Supervisor executed Hot Standby Swap: replaced Disputed ${activeId} with Standby ${standbyId} on schedule run ${sched.runNumber || 'N/A'}. Primary coach SCADA data captured.`,
+                timestamp: new Date().toISOString(),
+                operator: 'Supervisor',
+                trainsetId: standbyId,
+                coachId: firstStandbyCoachId,
+                scada
+            };
+            setHistory(prev => [logEntry as any, ...prev]);
+
             setSwapModalActiveInfo(null);
             alert(`Hot Standby Swap Committed! Disputed ${activeId} replaced with Standby ${standbyId} on active schedule.`);
         } catch (err: any) {
@@ -229,6 +430,25 @@ export const SupervisorDashboard = () => {
                 runNumber: undefined
             } : f));
 
+            // Log to Audit Trail with SCADA telemetry for the canceled trainset's coach
+            const activeTrain = fleet.find(f => f.id === activeTrainId);
+            const firstActiveCoachId = activeTrain?.coaches?.[0];
+            const scada = firstActiveCoachId ? getSCADAMetrics(firstActiveCoachId) : undefined;
+
+            const logEntry = {
+                id: `AUD-CNCL-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                type: 'Depot_Operation',
+                category: 'Depot Operations',
+                title: 'Active Service Canceled',
+                detail: `Supervisor canceled and terminated the active service for Trainset ${activeTrainId}. Primary coach SCADA data captured.`,
+                timestamp: new Date().toISOString(),
+                operator: 'Supervisor',
+                trainsetId: activeTrainId,
+                coachId: firstActiveCoachId,
+                scada
+            };
+            setHistory(prev => [logEntry as any, ...prev]);
+
             alert(`Active run for ${activeTrainId} successfully canceled.`);
         } catch (err: any) {
             console.error("Error canceling active run:", err);
@@ -262,6 +482,25 @@ export const SupervisorDashboard = () => {
                 recallRequested: false
             } : f));
 
+            // Log to Audit Trail with SCADA telemetry for the recalled trainset's coach
+            const targetTrain = fleet.find(f => f.id === trainId);
+            const firstCoachId = targetTrain?.coaches?.[0];
+            const scada = firstCoachId ? getSCADAMetrics(firstCoachId) : undefined;
+
+            const logEntry = {
+                id: `AUD-RCLR-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                type: 'Depot_Operation',
+                category: 'Depot Operations',
+                title: 'Recall Authorized',
+                detail: `Supervisor authorized recall for Trainset ${trainId}: returned to Standby. Primary coach SCADA data captured.`,
+                timestamp: new Date().toISOString(),
+                operator: 'Supervisor',
+                trainsetId: trainId,
+                coachId: firstCoachId,
+                scada
+            };
+            setHistory(prev => [logEntry as any, ...prev]);
+
             alert(`Recall Authorized. ${trainId} returned to Standby.`);
         } catch (err: any) {
             console.error("Error authorizing recall:", err);
@@ -275,6 +514,25 @@ export const SupervisorDashboard = () => {
                 .update({ recall_requested: false })
                 .eq('id', trainId);
             if (error) throw error;
+
+            // Log to Audit Trail with SCADA telemetry for the denied recall trainset's coach
+            const targetTrain = fleet.find(f => f.id === trainId);
+            const firstCoachId = targetTrain?.coaches?.[0];
+            const scada = firstCoachId ? getSCADAMetrics(firstCoachId) : undefined;
+
+            const logEntry = {
+                id: `AUD-RCLD-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                type: 'Depot_Operation',
+                category: 'Depot Operations',
+                title: 'Recall Denied',
+                detail: `Supervisor denied recall request for Trainset ${trainId}. Primary coach SCADA data captured.`,
+                timestamp: new Date().toISOString(),
+                operator: 'Supervisor',
+                trainsetId: trainId,
+                coachId: firstCoachId,
+                scada
+            };
+            setHistory(prev => [logEntry as any, ...prev]);
 
             setFleet(prev => prev.map(f => f.id === trainId ? { ...f, recallRequested: false } : f));
         } catch (err: any) {
@@ -489,6 +747,376 @@ export const SupervisorDashboard = () => {
                     </div>
                 </div>
 
+            </div>
+
+            {/* Depot Operations & Live Bay Control Section */}
+            <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm space-y-6">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-4">
+                    <div>
+                        <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                            <Activity className="w-5 h-5 text-metro-blue" /> Depot Operations: Live Bay Control
+                        </h3>
+                        <p className="text-xs text-slate-500">Monitor maintenance and cleaning bays, toggle operational availability, and view active coach servicing status.</p>
+                    </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    {/* Left Column: Maintenance & Cleaning Bays Lists (Occupies 2/3 columns on large screens) */}
+                    <div className="lg:col-span-2 space-y-6">
+                        
+                        {/* Maintenance Bays Subgrid */}
+                        <div className="space-y-3">
+                            <div className="flex items-center gap-2">
+                                <Wrench className="w-4 h-4 text-metro-orange" />
+                                <h4 className="text-sm font-bold text-slate-700 uppercase tracking-wider">Maintenance Bays (M-Bays)</h4>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                {maintenanceBays.map(bay => {
+                                    const isSelected = selectedBay && selectedBay.id === bay.id;
+                                    const occupyingCoach = bay.currentTask;
+                                    return (
+                                        <div 
+                                            key={bay.id} 
+                                            onClick={() => setSelectedBay({ ...bay, type: 'Maintenance' })}
+                                            className={cn(
+                                                "p-4 rounded-2xl border transition-all cursor-pointer relative overflow-hidden group shadow-sm flex flex-col justify-between min-h-[140px]",
+                                                isSelected 
+                                                    ? "bg-slate-50 border-metro-orange ring-1 ring-metro-orange shadow-md" 
+                                                    : "bg-white hover:bg-slate-50 border-slate-200 hover:border-slate-350"
+                                            )}
+                                        >
+                                            <div className="flex justify-between items-start">
+                                                <div>
+                                                    <span className="text-[10px] font-bold text-slate-400 uppercase font-mono">{bay.id}</span>
+                                                    <h5 className="font-extrabold text-slate-800 mt-0.5">{bay.id}</h5>
+                                                </div>
+                                                <span className={cn(
+                                                    "px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider",
+                                                    !bay.functional 
+                                                        ? "bg-slate-100 text-slate-500 border border-slate-200" 
+                                                        : bay.status === 'Occupied' 
+                                                            ? "bg-amber-50 text-metro-orange border border-amber-250 animate-pulse" 
+                                                            : "bg-emerald-50 text-emerald-600 border border-emerald-250"
+                                                )}>
+                                                    {!bay.functional ? 'Offline' : bay.status}
+                                                </span>
+                                            </div>
+
+                                            <div className="mt-4 space-y-1">
+                                                <p className="text-[10px] text-slate-400 font-bold uppercase">Current Assignment</p>
+                                                {bay.status === 'Occupied' && occupyingCoach ? (
+                                                    <div className="flex items-center gap-1.5 text-slate-800 font-bold text-xs">
+                                                        <div className="w-2 h-2 rounded-full bg-metro-orange animate-ping shrink-0" />
+                                                        <span>Coach {occupyingCoach}</span>
+                                                    </div>
+                                                ) : (
+                                                    <p className="text-xs text-slate-500 font-semibold">{!bay.functional ? 'Bay Deactivated' : 'Ready / Open'}</p>
+                                                )}
+                                            </div>
+
+                                            <div className="mt-4 flex items-center justify-between pt-2 border-t border-slate-100/50">
+                                                <span className="text-[10px] font-semibold text-slate-500 flex items-center gap-1">
+                                                    <Clock className="w-3 h-3 text-slate-400" />
+                                                    {!bay.functional ? 'Inactive' : bay.status === 'Occupied' ? 'In Progress' : 'Idle'}
+                                                </span>
+                                                <span className="text-[10px] font-black text-metro-orange opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5">
+                                                    Inspect <ChevronRight className="w-3 h-3" />
+                                                </span>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+
+                        {/* Cleaning Bays Subgrid */}
+                        <div className="space-y-3">
+                            <div className="flex items-center gap-2">
+                                <Sparkles className="w-4 h-4 text-metro-blue" />
+                                <h4 className="text-sm font-bold text-slate-700 uppercase tracking-wider">Cleaning Bays (C-Bays)</h4>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                                {cleaningBays.map(bay => {
+                                    const isSelected = selectedBay && selectedBay.id === bay.id;
+                                    const occupyingCoach = bay.currentTask;
+                                    return (
+                                        <div 
+                                            key={bay.id} 
+                                            onClick={() => setSelectedBay({ ...bay, type: 'Cleaning' })}
+                                            className={cn(
+                                                "p-4 rounded-2xl border transition-all cursor-pointer relative overflow-hidden group shadow-sm flex flex-col justify-between min-h-[140px]",
+                                                isSelected 
+                                                    ? "bg-slate-50 border-metro-blue ring-1 ring-metro-blue shadow-md" 
+                                                    : "bg-white hover:bg-slate-50 border-slate-200 hover:border-slate-350"
+                                            )}
+                                        >
+                                            <div className="flex justify-between items-start">
+                                                <div>
+                                                    <span className="text-[10px] font-bold text-slate-400 uppercase font-mono">{bay.id}</span>
+                                                    <h5 className="font-extrabold text-slate-800 mt-0.5">{bay.id}</h5>
+                                                </div>
+                                                <span className={cn(
+                                                    "px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider",
+                                                    !bay.functional 
+                                                        ? "bg-slate-100 text-slate-500 border border-slate-200" 
+                                                        : bay.status === 'Occupied' 
+                                                            ? "bg-sky-50 text-metro-blue border border-sky-250 animate-pulse" 
+                                                            : "bg-emerald-50 text-emerald-600 border border-emerald-250"
+                                                )}>
+                                                    {!bay.functional ? 'Offline' : bay.status}
+                                                </span>
+                                            </div>
+
+                                            <div className="mt-4 space-y-1">
+                                                <p className="text-[10px] text-slate-400 font-bold uppercase">Current Assignment</p>
+                                                {bay.status === 'Occupied' && occupyingCoach ? (
+                                                    <div className="flex items-center gap-1.5 text-slate-800 font-bold text-xs">
+                                                        <div className="w-2 h-2 rounded-full bg-metro-blue animate-ping shrink-0" />
+                                                        <span>Coach {occupyingCoach}</span>
+                                                    </div>
+                                                ) : (
+                                                    <p className="text-xs text-slate-500 font-semibold">{!bay.functional ? 'Bay Deactivated' : 'Ready / Open'}</p>
+                                                )}
+                                            </div>
+
+                                            <div className="mt-4 flex items-center justify-between pt-2 border-t border-slate-100/50">
+                                                <span className="text-[10px] font-semibold text-slate-500 flex items-center gap-1">
+                                                    <Clock className="w-3 h-3 text-slate-400" />
+                                                    {!bay.functional ? 'Inactive' : bay.status === 'Occupied' ? 'In Progress' : 'Idle'}
+                                                </span>
+                                                <span className="text-[10px] font-black text-metro-blue opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5">
+                                                    Inspect <ChevronRight className="w-3 h-3" />
+                                                </span>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+
+                    </div>
+
+                    {/* Right Column: Selected Bay Information Panel (Occupies 1/3 columns) */}
+                    <div className="bg-slate-50/50 p-5 rounded-2xl border border-slate-200 flex flex-col justify-between min-h-[350px]">
+                        {selectedBay ? (() => {
+                            const bayData = selectedBay.type === 'Maintenance' 
+                                ? maintenanceBays.find(b => b.id === selectedBay.id) 
+                                : cleaningBays.find(b => b.id === selectedBay.id);
+                            
+                            if (!bayData) return <div className="text-center text-slate-400 text-xs font-semibold my-auto">Bay info unavailable</div>;
+
+                            const occupyingCoach = bayData.currentTask;
+                            const coach = occupyingCoach ? coaches.find(c => c.id === occupyingCoach) : null;
+                            const isMaint = selectedBay.type === 'Maintenance';
+
+                            // Generate realistic SCADA Telemetry based on coach ID or some stable attributes
+                            const getSCADAMetrics = (cId: string) => {
+                                const num = parseInt(cId.replace(/[^0-9]/g, '')) || 100;
+                                return {
+                                    brakePad: ((num % 5) + 3.2).toFixed(1) + " mm",
+                                    pantoForce: ((num % 30) + 75) + " N",
+                                    vibrations: ((num % 10) / 100 + 0.02).toFixed(2) + " g",
+                                    shoeTemp: ((num % 15) + 38) + " °C",
+                                    doorCycles: ((num * 120) % 10000 + 12000).toLocaleString()
+                                };
+                            };
+
+                            const metrics = coach ? getSCADAMetrics(coach.id) : null;
+
+                            return (
+                                <div className="space-y-5 flex-1 flex flex-col justify-between">
+                                    <div className="space-y-4">
+                                        <div className="flex justify-between items-start">
+                                            <div className="flex items-center gap-2">
+                                                {isMaint ? <Wrench className="w-5 h-5 text-metro-orange" /> : <Sparkles className="w-5 h-5 text-metro-blue" />}
+                                                <div>
+                                                    <h4 className="font-extrabold text-slate-800 text-sm">{bayData.id}</h4>
+                                                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">{selectedBay.type} Service Bay</p>
+                                                </div>
+                                            </div>
+                                            <button 
+                                                onClick={() => setSelectedBay(null)} 
+                                                className="p-1 text-slate-400 hover:text-slate-655 hover:bg-slate-200/50 rounded-full transition-colors"
+                                            >
+                                                <X className="w-4 h-4" />
+                                            </button>
+                                        </div>
+
+                                        {/* Bay Operational Status (Read-Only) */}
+                                        <div className="p-4 bg-white border border-slate-200 rounded-xl space-y-2 shadow-sm">
+                                            <div className="flex items-center justify-between text-xs">
+                                                <span className="font-extrabold text-slate-500 uppercase tracking-wider text-[10px]">Operational Status</span>
+                                                <span className={cn(
+                                                    "px-2.5 py-1 rounded-lg text-[10px] font-black uppercase tracking-wider border",
+                                                    bayData.functional 
+                                                        ? "bg-emerald-50 text-emerald-600 border-emerald-250" 
+                                                        : "bg-red-50 text-red-600 border-red-250"
+                                                )}>
+                                                    {bayData.functional ? 'ONLINE / ACTIVE' : 'OFFLINE / INACTIVE'}
+                                                </span>
+                                            </div>
+                                            <p className="text-[10px] text-slate-400 font-semibold leading-relaxed">
+                                                {bayData.functional 
+                                                    ? "This bay is online and visible to yard planners for coach assignment." 
+                                                    : "This bay is currently marked offline. Yard planners cannot assign coaches here."}
+                                            </p>
+                                        </div>
+
+                                        {/* Supervisor Log Comments Box */}
+                                        <div className="p-4 bg-white border border-slate-200 rounded-xl space-y-3 shadow-sm">
+                                            <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+                                                <h5 className="text-[10px] text-slate-500 font-bold uppercase tracking-wider flex items-center gap-1.5">
+                                                    <FileText className="w-3.5 h-3.5 text-metro-blue" />
+                                                    Supervisor Log Entries
+                                                </h5>
+                                                {bayComments[bayData.id] && (
+                                                    <span className="text-[9px] bg-slate-100 text-slate-505 px-1.5 py-0.5 rounded font-mono font-bold">
+                                                        Log Active
+                                                    </span>
+                                                )}
+                                            </div>
+                                            
+                                            <div className="space-y-2">
+                                                <textarea
+                                                    value={commentInput}
+                                                    onChange={(e) => setCommentInput(e.target.value)}
+                                                    placeholder="File operational notes, bay condition logs, or maintenance directives here..."
+                                                    className="w-full min-h-[90px] p-2.5 text-xs bg-slate-50 border border-slate-200 focus:border-metro-blue focus:bg-white rounded-xl focus:outline-none resize-none transition-all placeholder:text-slate-400 text-slate-700 font-semibold leading-relaxed"
+                                                />
+                                                
+                                                <div className="flex justify-between items-center pt-1">
+                                                    <span className="text-[9.5px] text-slate-400 font-semibold">
+                                                        {saveSuccess ? (
+                                                            <span className="text-emerald-600 flex items-center gap-1 font-bold">
+                                                                <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> Log saved successfully
+                                                            </span>
+                                                        ) : (
+                                                            "Notes are shared with Planners"
+                                                        )}
+                                                    </span>
+                                                    <button
+                                                        onClick={() => saveBayComment(bayData.id)}
+                                                        disabled={isSavingComment}
+                                                        className="px-3 py-1.5 bg-slate-800 text-white rounded-lg text-[10px] font-black tracking-wider uppercase hover:bg-slate-700 transition-colors shadow-sm disabled:opacity-50"
+                                                    >
+                                                        {isSavingComment ? 'Saving...' : 'Save Log Entry'}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* Occupying Coach Details */}
+                                        {!bayData.functional ? (
+                                            <div className="p-8 text-center bg-slate-100/50 border border-slate-200 rounded-xl text-slate-400 text-xs font-semibold">
+                                                <Ban className="w-8 h-8 mx-auto mb-2 text-slate-350" />
+                                                Bay deactivated. Turn online to receive coaches.
+                                            </div>
+                                        ) : bayData.status === 'Occupied' && coach ? (
+                                            <div className="space-y-4">
+                                                <div className="p-4 bg-white border border-slate-200 rounded-xl space-y-3">
+                                                    <div className="flex justify-between items-center">
+                                                        <div>
+                                                            <span className="text-[9px] text-slate-400 font-bold uppercase block">OCCUPYING VEHICLE</span>
+                                                            <h5 className="font-black text-slate-800 text-sm">{coach.id}</h5>
+                                                        </div>
+                                                        <span className={cn(
+                                                            "px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border",
+                                                            coach.type === 'DMC' ? "bg-purple-50 text-purple-600 border-purple-200" : "bg-blue-50 text-blue-600 border-blue-200"
+                                                        )}>
+                                                            {coach.type} Coach
+                                                        </span>
+                                                    </div>
+
+                                                    {/* Health gauge */}
+                                                    <div className="space-y-1">
+                                                        <div className="flex justify-between items-center text-[10px] font-semibold text-slate-500">
+                                                            <span>Telemetry Wear Health</span>
+                                                            <span className={cn(
+                                                                "font-bold",
+                                                                coach.health > 80 ? "text-emerald-600" : coach.health > 50 ? "text-amber-600" : "text-red-600"
+                                                            )}>{coach.health}%</span>
+                                                        </div>
+                                                        <div className="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                                                            <div 
+                                                                className={cn(
+                                                                    "h-full rounded-full transition-all duration-500",
+                                                                    coach.health > 80 ? "bg-emerald-500" : coach.health > 50 ? "bg-amber-500" : "bg-red-500"
+                                                                )}
+                                                                style={{ width: `${coach.health}%` }}
+                                                            />
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="grid grid-cols-2 gap-3 text-xs pt-1">
+                                                        <div>
+                                                            <span className="text-[9px] text-slate-400 font-bold uppercase block">ACCUMULATED MILEAGE</span>
+                                                            <span className="font-extrabold text-slate-700 font-mono">{coach.mileage.toLocaleString()} KM</span>
+                                                        </div>
+                                                        <div>
+                                                            <span className="text-[9px] text-slate-400 font-bold uppercase block">MAINT. STATUS</span>
+                                                            <span className="font-extrabold text-slate-700">{coach.maintenanceStatus}</span>
+                                                        </div>
+                                                    </div>
+                                                </div>
+
+                                                {/* SCADA Telemetry Subsystem Readings */}
+                                                <div className="p-3 bg-white border border-slate-200 rounded-xl space-y-2">
+                                                    <h5 className="text-[10px] text-slate-500 font-bold uppercase tracking-wider flex items-center gap-1">
+                                                        <Activity className="w-3.5 h-3.5 text-metro-blue" />
+                                                        SCADA Diagnostic Telemetry
+                                                    </h5>
+                                                    <div className="grid grid-cols-2 gap-2 text-[11px] font-semibold text-slate-655 font-mono">
+                                                        <div className="p-1.5 bg-slate-50 rounded border border-slate-100 flex justify-between items-center">
+                                                            <span className="text-slate-400 font-sans">Brake Pad:</span>
+                                                            <span className="text-slate-800 font-bold">{metrics?.brakePad}</span>
+                                                        </div>
+                                                        <div className="p-1.5 bg-slate-50 rounded border border-slate-100 flex justify-between items-center">
+                                                            <span className="text-slate-400 font-sans">Panto Force:</span>
+                                                            <span className="text-slate-800 font-bold">{metrics?.pantoForce}</span>
+                                                        </div>
+                                                        <div className="p-1.5 bg-slate-50 rounded border border-slate-100 flex justify-between items-center">
+                                                            <span className="text-slate-400 font-sans">Vibration:</span>
+                                                            <span className="text-slate-800 font-bold">{metrics?.vibrations}</span>
+                                                        </div>
+                                                        <div className="p-1.5 bg-slate-50 rounded border border-slate-100 flex justify-between items-center">
+                                                            <span className="text-slate-400 font-sans">Shoe Temp:</span>
+                                                            <span className="text-slate-800 font-bold">{metrics?.shoeTemp}</span>
+                                                        </div>
+                                                        <div className="col-span-2 p-1.5 bg-slate-50 rounded border border-slate-100 flex justify-between items-center">
+                                                            <span className="text-slate-400 font-sans">Door Cycle Count:</span>
+                                                            <span className="text-slate-800 font-bold">{metrics?.doorCycles}</span>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <div className="p-8 text-center bg-white border border-slate-200 border-dashed rounded-xl text-slate-400 text-xs font-semibold">
+                                                <ShieldCheck className="w-8 h-8 mx-auto mb-2 text-emerald-500/80" />
+                                                Bay stabling track clear. Ready to receive next coach.
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* Read-Only Status for Supervisor */}
+                                    {bayData.functional && bayData.status === 'Occupied' && coach && (
+                                        <div className="p-3 bg-amber-50/60 border border-amber-150 rounded-xl text-[10.5px] text-amber-700 font-bold flex items-center gap-2 mt-4 shadow-sm">
+                                            <Clock className="w-4 h-4 shrink-0 text-metro-orange animate-pulse" />
+                                            <span>Active servicing in progress. Servicing release controls are reserved for Yard Planners.</span>
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })() : (
+                            <div className="my-auto text-center p-6 space-y-3">
+                                <Eye className="w-10 h-10 text-slate-350 mx-auto" />
+                                <div>
+                                    <h4 className="font-extrabold text-slate-700 text-sm">Select a Bay to Inspect</h4>
+                                    <p className="text-xs text-slate-400 mt-1">Select a stabling maintenance or cleaning bay from the grid to view operational metrics, SCADA telemetry diagnostic logs, or to execute service completion updates.</p>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
             </div>
 
             {/* Modals & Popups */}

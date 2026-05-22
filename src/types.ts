@@ -86,3 +86,27 @@ export interface Bay {
     functional: boolean;
     currentTask: string | null;
 }
+
+export interface SCADAMetrics {
+    brakePad: string;
+    pantoForce: string;
+    vibrations: string;
+    shoeTemp: string;
+    doorCycles: string;
+}
+
+export interface AuditLogEntry {
+    id: string;
+    type: 'AI_Evaluation' | 'Depot_Operation';
+    category: 'Approvals' | 'Rejections' | 'Auto-Actions' | 'Depot Operations';
+    title: string;
+    detail: string;
+    timestamp: string;
+    operator: 'Planner' | 'Supervisor' | 'System';
+    readinessScore?: number;
+    decision?: string;
+    trainsetId?: string;
+    bayId?: string;
+    coachId?: string;
+    scada?: SCADAMetrics;
+}

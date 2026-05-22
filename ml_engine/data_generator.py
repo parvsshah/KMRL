@@ -69,9 +69,12 @@ def generate_synthetic_kmrl_telemetry(num_records=1500, random_seed=42):
     df = pd.DataFrame(data)
     
     # Save to data directory
-    os.makedirs("data", exist_ok=True)
-    df.to_csv("data/kmrl_telemetry_historical.csv", index=False)
-    print(f"Generated {num_records} telemetry records saved to 'data/kmrl_telemetry_historical.csv'.")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(base_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    csv_path = os.path.join(data_dir, "kmrl_telemetry_historical.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"Generated {num_records} telemetry records saved to '{csv_path}'.")
     return df
 
 if __name__ == "__main__":
