@@ -2,7 +2,7 @@ import os
 import sys
 import subprocess
 
-# Ensure Flask and Flask-CORS are installed
+
 try:
     from flask import Flask, request, jsonify
     from flask_cors import CORS
@@ -12,16 +12,17 @@ except ImportError:
     from flask import Flask, request, jsonify
     from flask_cors import CORS
 
-# Add parent directory and ml_engine directory to path so ml_engine is fully importable
+
 base_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(base_dir)
 sys.path.append(os.path.join(base_dir, "ml_engine"))
 
-# Import machine learning pipeline wrappers
+
 try:
     from ml_engine.predict import predict_maintenance_need, load_predictive_models
     from ml_engine.train import train_predictive_models
     from ml_engine.data_generator import generate_synthetic_kmrl_telemetry
+    from ml_engine.health_logic import calculate_trainset_health
 except ImportError as e:
     print(f"Import Error: {e}. Ensuring path structure holds...")
 
@@ -49,12 +50,105 @@ def health_check():
         "python_version": sys.version,
         "available_endpoints": [
             "GET  /api/health",
+            "POST /api/health/assess",
             "POST /api/predict",
             "POST /api/predict/fleet",
             "POST /api/train",
             "POST /api/generate-data"
         ]
     }), 200
+
+@app.route("/api/health/assess", methods=["POST"])
+def assess_health():
+    """
+    Perform a multi-factor precision health assessment and ML predictive diagnostics
+    for an entire trainset and its constituent coaches.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        trainset_id = data.get("trainset_id", "Unknown")
+        coaches_list = data.get("coaches", [])
+        
+        if not isinstance(coaches_list, list) or len(coaches_list) == 0:
+            return jsonify({
+                "status": "ERROR",
+                "message": "Expected a non-empty 'coaches' array containing coach telemetry."
+            }), 400
+            
+        # 1. Compute Precision Physics Health Scores
+        health_assessment = calculate_trainset_health(coaches_list)
+        
+        # 2. Enrich with ML Predictive Maintenance Diagnostics
+        detailed_coaches = []
+        for index, coach in enumerate(coaches_list):
+            c_id = coach.get("id", coach.get("coach_id", f"Coach-{index+1}"))
+            
+            # Extract inputs with nominal defaults
+            brake_mm = float(coach.get("brake_pad_thickness_mm", 15.0))
+            panto_force = float(coach.get("pantograph_force_n", 120.0))
+            vibrations = float(coach.get("cabin_vibrations_g", 0.04))
+            temp_c = float(coach.get("guide_shoe_temp_c", 42.0))
+            doors = int(coach.get("door_cycles", 0))
+            
+            # ML Model Inference
+            ml_diagnostics = predict_maintenance_need(
+                brake_mm=brake_mm,
+                panto_force=panto_force,
+                vibrations=vibrations,
+                temp_c=temp_c,
+                doors=doors
+            )
+            
+            # Find the corresponding calculated physics health for this coach
+            coach_phys_health = next(
+                (c for c in health_assessment["coaches_health"] if c["coach_id"] == c_id), 
+                None
+            )
+            
+            detailed_coaches.append({
+                "coach_id": c_id,
+                "precision_physics_health": coach_phys_health,
+                "ml_predictive_diagnostics": ml_diagnostics
+            })
+            
+        # Overall ML metrics for trainset RUL (Safest bound is the lowest remaining mileage)
+        ruls = [c["ml_predictive_diagnostics"]["remaining_useful_life_km"] for c in detailed_coaches]
+        min_rul = min(ruls) if ruls else 0.0
+        
+        urgencies = [c["ml_predictive_diagnostics"]["maintenance_urgency"] for c in detailed_coaches]
+        # Most severe urgency order: IMMINENT > DUE SOON > OPTIMAL
+        worst_urgency = "OPTIMAL"
+        if "IMMINENT" in urgencies:
+            worst_urgency = "IMMINENT"
+        elif "DUE SOON" in urgencies:
+            worst_urgency = "DUE SOON"
+            
+        return jsonify({
+            "status": "SUCCESS",
+            "trainset_id": trainset_id,
+            "precision_physics_health": {
+                "trainset_health": health_assessment["trainset_health"],
+                "average_coach_health": health_assessment["average_coach_health"],
+                "minimum_coach_health": health_assessment["minimum_coach_health"],
+                "operational_status": health_assessment["status"]
+            },
+            "ml_predictive_status": {
+                "minimum_rul_km": min_rul,
+                "worst_urgency_status": worst_urgency,
+                "strategic_recommendation": (
+                    "IMMEDIATE DEPOT RECALL & SERVICE" if worst_urgency == "IMMINENT"
+                    else "SCHEDULE DEPOT SERVICE SOON" if worst_urgency == "DUE SOON"
+                    else "NOMINAL MAINLINE OPERATIONS"
+                )
+            },
+            "coaches": detailed_coaches
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "status": "ERROR",
+            "message": f"Precision health assessment failure: {str(e)}"
+        }), 500
 
 @app.route("/api/predict", methods=["POST"])
 def predict_telemetry():

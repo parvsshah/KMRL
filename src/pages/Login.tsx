@@ -9,32 +9,80 @@ export const Login = () => {
     const { setUserRole } = useAppContext();
     const navigate = useNavigate();
     const [selectedRole, setSelectedRole] = useState<'Planner' | 'Supervisor'>('Planner');
-    const [username, setUsername] = useState('kmrl.operations');
-    const [password, setPassword] = useState('••••••••');
+    const [username, setUsername] = useState('planner.ops');
+    const [password, setPassword] = useState('planner123');
     const [error, setError] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
+
+    const handleRoleChange = (role: 'Planner' | 'Supervisor') => {
+        setSelectedRole(role);
+        setError(null);
+        if (role === 'Planner') {
+            setUsername('planner.ops');
+            setPassword('planner123');
+        } else {
+            setUsername('supervisor.control');
+            setPassword('supervisor123');
+        }
+    };
 
     const handleLogin = (e: React.FormEvent) => {
         e.preventDefault();
         setLoading(true);
         setError(null);
 
-        // Standard simulation of authenticating Kochi Metro Rail Operations credentials
+        // Standard validation of authenticating Kochi Metro Rail Operations credentials
+        const validCredentials = {
+            Planner: {
+                username: 'planner.ops',
+                password: 'planner123'
+            },
+            Supervisor: {
+                username: 'supervisor.control',
+                password: 'supervisor123'
+            }
+        };
+
+        const targetCreds = validCredentials[selectedRole];
+
         setTimeout(() => {
-            setUserRole(selectedRole);
-            setLoading(false);
-            if (selectedRole === 'Planner') {
-                navigate('/');
+            if (username.trim() === targetCreds.username && password === targetCreds.password) {
+                setUserRole(selectedRole);
+                setLoading(false);
+                if (selectedRole === 'Planner') {
+                    navigate('/');
+                } else {
+                    navigate('/supervisor');
+                }
             } else {
-                navigate('/supervisor');
+                setLoading(false);
+                setError(`Authentication failed. Correct credentials for ${selectedRole} are: Username '${targetCreds.username}' and Password '${targetCreds.password}'.`);
             }
         }, 800);
     };
 
     const handleQuickLogin = (role: 'Planner' | 'Supervisor') => {
         setLoading(true);
-        setUserRole(role);
+        setError(null);
+        
+        const validCredentials = {
+            Planner: {
+                username: 'planner.ops',
+                password: 'planner123'
+            },
+            Supervisor: {
+                username: 'supervisor.control',
+                password: 'supervisor123'
+            }
+        };
+        
+        const targetCreds = validCredentials[role];
+        setSelectedRole(role);
+        setUsername(targetCreds.username);
+        setPassword(targetCreds.password);
+
         setTimeout(() => {
+            setUserRole(role);
             setLoading(false);
             if (role === 'Planner') {
                 navigate('/');
@@ -96,12 +144,19 @@ export const Login = () => {
                     </div>
 
                     <form onSubmit={handleLogin} className="space-y-6">
+                        {error && (
+                            <div className="p-3.5 bg-red-50 border border-red-200 text-red-600 text-xs font-semibold rounded-2xl flex items-center gap-2.5 leading-relaxed shadow-sm">
+                                <span className="w-2 h-2 rounded-full bg-red-500 shrink-0" />
+                                <span>{error}</span>
+                            </div>
+                        )}
+
                         {/* Dual Role Selector Cards */}
                         <div className="grid grid-cols-2 gap-4">
                             
                             {/* Planner Card */}
                             <div 
-                                onClick={() => setSelectedRole('Planner')}
+                                onClick={() => handleRoleChange('Planner')}
                                 className={`p-4 rounded-2xl border-2 transition-all duration-300 cursor-pointer flex flex-col justify-between gap-3 text-left relative overflow-hidden group shadow-sm ${
                                     selectedRole === 'Planner' 
                                         ? 'bg-gradient-to-b from-white to-emerald-50/20 border-emerald-500 shadow-emerald-500/5 ring-1 ring-emerald-500/20' 
@@ -128,7 +183,7 @@ export const Login = () => {
 
                             {/* Supervisor Card */}
                             <div 
-                                onClick={() => setSelectedRole('Supervisor')}
+                                onClick={() => handleRoleChange('Supervisor')}
                                 className={`p-4 rounded-2xl border-2 transition-all duration-300 cursor-pointer flex flex-col justify-between gap-3 text-left relative overflow-hidden group shadow-sm ${
                                     selectedRole === 'Supervisor' 
                                         ? 'bg-gradient-to-b from-white to-blue-50/20 border-metro-blue shadow-metro-blue/5 ring-1 ring-metro-blue/20' 
